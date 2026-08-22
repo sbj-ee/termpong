@@ -158,6 +158,57 @@ int main() {
         check(after.right_y < mid.right_y, "P2 arrow moves the right paddle up");
     }
 
+    // --- a held key must not stall: the terminal sends one event, then waits
+    //     out its own auto-repeat delay before the stream starts
+    {
+        g_repeat = Repeat{};
+        g_now = 0.0;
+        Game g(30, 100);
+        g.handle_key('2');            // two players: nothing else drives P1
+        const double dt = 1.0 / 60.0;
+        double next = 0.0, slowest = 1e9;
+        // 0.55 s of key-down, delivered as a terminal would: one press, a
+        // 0.5 s gap, then 30 repeats a second.  Stop before the paddle can
+        // reach the floor, where it is meant to stand still.
+        for (int i = 0; i * dt < 0.55; ++i) {
+            g_now = i * dt;
+            if (g_now >= next) {
+                g.handle_key('s');
+                next = (next == 0.0) ? 0.5 : next + 1.0 / 30.0;
+            }
+            double before = g.snapshot().left_y;
+            g.update(dt);
+            double v = (g.snapshot().left_y - before) / dt;
+            if (g_now > 0.05) slowest = std::min(slowest, v);
+        }
+        double player_v = g.snapshot().H / PLAYER_CROSS;
+        check(slowest > 0.15 * player_v, "a held key never lets the paddle stall");
+        std::printf("     ... slowest %.0f%% of top speed while held\n",
+                    100.0 * slowest / player_v);
+    }
+
+    // --- the computer settles onto its mark rather than hunting around it
+    {
+        g_now = 0.0;
+        Game g(30, 100);
+        g.setup(Mode::Demo);
+        const double dt = 1.0 / 60.0;
+        double prev_y = g.snapshot().right_y, prev_v = 0.0, jerk = 0.0;
+        int frames = 60 * 60;
+        for (int i = 0; i < frames; ++i) {
+            g_now += dt;
+            g.update(dt);
+            double y = g.snapshot().right_y;
+            double v = (y - prev_y) / dt;
+            jerk += std::fabs(v - prev_v);
+            prev_y = y; prev_v = v;
+        }
+        double player_v = g.snapshot().H / PLAYER_CROSS;
+        double per_frame = jerk / frames / player_v;
+        check(per_frame < 0.012, "the computer's paddle changes speed smoothly");
+        std::printf("     ... %.1f%% of top speed per frame\n", 100.0 * per_frame);
+    }
+
     // --- resize keeps everything on the field
     {
         Game g(30, 100);

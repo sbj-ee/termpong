@@ -49,10 +49,19 @@ rallies wind up until someone cannot reach the ball.
 Speeds are expressed as time to cross the field rather than absolute numbers,
 so the game plays at the same pace in an 80x24 window and a 220x60 one.
 
-The ball and paddles are drawn at half-cell vertical resolution using block
-glyphs, giving twice the vertical precision the character grid has, and the
-ball is simulated at 480 Hz in fixed substeps under a 60 fps render — so motion
-stays smooth and the physics does not change with the frame rate.
+Every cell is drawn as four quadrants using block glyphs, so the ball moves on
+a grid with twice the precision of the character grid in both directions, and
+its trail is sampled on simulated time rather than on frames. Everything that
+moves — the paddles included — is stepped at 480 Hz in fixed substeps under a
+60 fps render paced to an absolute deadline, so what happens on screen does not
+depend on how fast the terminal happens to be drawing.
+
+Terminals report key presses but never releases, so a held key arrives as the
+terminal's own auto-repeat: one event, a long initial delay, then a fast
+stream. Both numbers differ between terminals and between users, so termpong
+watches the repeats and learns them. A press buys a slice of full speed and
+then coasts at a quarter of it, which covers the gap before the repeats start
+without turning a tap into a lunge — the paddle never stops dead mid-hold.
 
 ## The opponent
 

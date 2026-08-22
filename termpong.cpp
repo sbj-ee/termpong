@@ -2,8 +2,8 @@
 //
 // Left paddle is yours, right paddle is the computer (or a second player).
 // The ball is simulated with real units, spin and drag rather than integer
-// cells, and drawn at half-cell vertical resolution with block glyphs, so
-// motion is smooth instead of steppy.
+// cells, and drawn at quarter-cell resolution with block glyphs, so motion is
+// smooth instead of steppy.
 //
 // Build: make      Run: ./termpong
 
@@ -77,10 +77,27 @@ constexpr double MAX_SPIN = 20.0;    // radians per second
 constexpr double PADDLE_RATIO = 6.5;    // field height / paddle height
 constexpr int PADDLE_MARGIN = 2;        // columns in from the field edge
 
-constexpr double KEY_HOLD = 0.11;       // a keypress keeps the paddle moving
+// Terminals report key presses but never releases, so a held key reaches us
+// as the terminal's own auto-repeat: one event, a long initial delay, then a
+// fast stream.  Both numbers vary by terminal and by the user's settings, so
+// a fixed hold window stutters once per press on some machines and drifts on
+// others.  These are only the starting guesses; the real values get learned
+// from the repeats as they arrive.
+constexpr double TAP_HOLD = 0.13;        // full speed bought by a single press
+constexpr double COAST_SPEED = 0.25;     // ...then a glide while it is in doubt
+constexpr double DEFAULT_DELAY = 0.45;   // assumed press -> first repeat
+constexpr double DEFAULT_RATE = 0.05;    // assumed repeat -> repeat
+constexpr double REPEAT_SPLIT = 1.0;     // further apart than this: a new press
+constexpr double DELAY_FLOOR = 0.12;     // shorter gaps are not an initial delay
+constexpr double RATE_CEILING = 0.35;    // longer gaps are not a repeat stream
+
+constexpr double SETTLE_TIME = 0.10;     // AI closing time; longer = gentler
 
 constexpr double SERVE_DELAY = 0.9;
-constexpr int TRAIL_LEN = 12;
+// The trail is sampled on simulated time, not on frames, so it is the same
+// streak whatever the terminal's frame rate turns out to be.
+constexpr double TRAIL_SAMPLE = 1.0 / 120.0;
+constexpr int TRAIL_LEN = 18;
 
 constexpr int MIN_WIDTH = 48;
 constexpr int MIN_HEIGHT = 16;
@@ -114,9 +131,9 @@ double frand(double lo, double hi) { return lo + frand() * (hi - lo); }
 
 // -------------------------------------------------------------------- colour
 
-// Every playfield cell is two vertically stacked half-cells, each holding one
-// of these palette slots.  A cell is then drawn as a space, a full block, or a
-// half block whose foreground and background carry the two halves.
+// Every playfield cell is a 2x2 grid of quadrants, each holding one of these
+// palette slots.  A cell is then drawn as the block glyph matching the pattern
+// of quadrants, with its two commonest inks as foreground and background.
 enum Ink : uint8_t {
     INK_NONE = 0, INK_WALL, INK_NET, INK_P1, INK_P2,
     INK_BALL, INK_TRAIL1, INK_TRAIL2, INK_SCORE, INK_ACCENT, INK_COUNT
@@ -157,13 +174,13 @@ struct TextCell {
     attr_t attr = 0;
 };
 
-// Two layers: a half-cell "ink" bitmap for the game objects, and a text layer
+// Two layers: a quadrant "ink" bitmap for the game objects, and a text layer
 // for the scoreboard and banners, which wins wherever it is set.
 class Canvas {
 public:
     void resize(int w, int h) {
         w_ = w; h_ = h;
-        sub_.assign(static_cast<size_t>(w) * h * 2, INK_NONE);
+        sub_.assign(static_cast<size_t>(w) * h * 4, INK_NONE);
         text_.assign(static_cast<size_t>(w) * h, TextCell{});
     }
 
@@ -175,14 +192,22 @@ public:
     int width() const { return w_; }
     int height() const { return h_; }
 
-    void plot(int subrow, int col, uint8_t ink) {
-        if (col < 0 || col >= w_ || subrow < 0 || subrow >= h_ * 2) return;
-        sub_[static_cast<size_t>(subrow) * w_ + col] = ink;
+    // Quadrant coordinates: two per cell in each direction.
+    void plot(int subrow, int subcol, uint8_t ink) {
+        if (subcol < 0 || subcol >= w_ * 2 || subrow < 0 || subrow >= h_ * 2)
+            return;
+        sub_[static_cast<size_t>(subrow) * w_ * 2 + subcol] = ink;
+    }
+
+    // Both quadrants of one whole column, for things a column wide.
+    void plot_col(int subrow, int col, uint8_t ink) {
+        plot(subrow, col * 2, ink);
+        plot(subrow, col * 2 + 1, ink);
     }
 
     // Fill a half-open span of half-rows in one column.
     void plot_span(int sub0, int sub1, int col, uint8_t ink) {
-        for (int s = sub0; s < sub1; ++s) plot(s, col, ink);
+        for (int s = sub0; s < sub1; ++s) plot_col(s, col, ink);
     }
 
     void text(int row, int col, const std::wstring& s, uint8_t ink,
@@ -202,23 +227,45 @@ public:
                     put(r, c, t.ch, t.ink, INK_NONE, t.attr);
                     continue;
                 }
-                uint8_t top = sub_[static_cast<size_t>(r * 2) * w_ + c];
-                uint8_t bot = sub_[static_cast<size_t>(r * 2 + 1) * w_ + c];
-                attr_t attr = (top == INK_BALL || bot == INK_BALL) ? A_BOLD : 0;
-                if (top == INK_NONE && bot == INK_NONE)
-                    put(r, c, L' ', INK_NONE, INK_NONE, 0);
-                else if (top == bot)
-                    put(r, c, L'█', top, INK_NONE, attr);   // full block
-                else if (bot == INK_NONE)
-                    put(r, c, L'▀', top, INK_NONE, attr);   // upper half
-                else if (top == INK_NONE)
-                    put(r, c, L'▄', bot, INK_NONE, attr);   // lower half
-                else
-                    put(r, c, L'▀', top, bot, attr);
+                uint8_t q[4] = {quad(r * 2, c * 2),     quad(r * 2, c * 2 + 1),
+                                quad(r * 2 + 1, c * 2), quad(r * 2 + 1, c * 2 + 1)};
+
+                // A cell carries one foreground and one background, so pick
+                // the two inks covering the most of it and fold the rest in.
+                uint8_t fg = INK_NONE, bg = INK_NONE;
+                int nfg = 0, nbg = 0;
+                for (int i = 0; i < 4; ++i) {
+                    if (q[i] == INK_NONE || q[i] == fg || q[i] == bg) continue;
+                    int n = 0;
+                    for (int j = 0; j < 4; ++j) if (q[j] == q[i]) ++n;
+                    if (n > nfg) { bg = fg; nbg = nfg; fg = q[i]; nfg = n; }
+                    else if (n > nbg) { bg = q[i]; nbg = n; }
+                }
+                if (fg == INK_NONE) { put(r, c, L' ', INK_NONE, INK_NONE, 0); continue; }
+                // The ball is what the eye follows, so it takes the
+                // foreground whenever it shares a cell with anything else.
+                if (fg != INK_BALL)
+                    for (int i = 0; i < 4; ++i)
+                        if (q[i] == INK_BALL) { bg = fg; fg = INK_BALL; break; }
+
+                int mask = 0;
+                for (int i = 0; i < 4; ++i) if (q[i] == fg) mask |= 1 << i;
+                attr_t attr = (fg == INK_BALL || bg == INK_BALL) ? A_BOLD : 0;
+                put(r, c, QUAD[mask], fg, bg, attr);
             }
     }
 
 private:
+    // Indexed by a bitmask of filled quadrants: 1 top-left, 2 top-right,
+    // 4 bottom-left, 8 bottom-right.
+    static constexpr wchar_t QUAD[16] = {
+        L' ',      L'\u2598', L'\u259d', L'\u2580', L'\u2596', L'\u258c', L'\u259e', L'\u259b',
+        L'\u2597', L'\u259a', L'\u2590', L'\u259c', L'\u2584', L'\u2599', L'\u259f', L'\u2588'};
+
+    uint8_t quad(int subrow, int subcol) const {
+        return sub_[static_cast<size_t>(subrow) * w_ * 2 + subcol];
+    }
+
     void put(int row, int col, wchar_t ch, uint8_t fg, uint8_t bg,
              attr_t attr) const {
         cchar_t cc;
@@ -263,8 +310,11 @@ struct Geometry {
     int subrow_of(double y) const {
         return play_top * 2 + static_cast<int>(std::floor(y * 2.0));
     }
-    int col_of(double x) const {
-        return clampv(static_cast<int>(std::floor(x / CELL_W)), 0, cols - 1);
+    // Half-column resolution, so a moving ball advances in half-cell steps
+    // horizontally as well as vertically.
+    int subcol_of(double x) const {
+        return clampv(static_cast<int>(std::floor(x / (CELL_W * 0.5))), 0,
+                      cols * 2 - 1);
     }
 };
 
@@ -382,21 +432,83 @@ struct Paddle {
     AiParams params = DIFFICULTY[1];
     double aim_off = 0, react_at = 0;
     bool committed = false;
+    double target = 0;       // where the computer wants its centre
+    bool waiting = false;    // ...but has not reacted yet
 
-    void drive(int dir, double dt, double H) {
-        if (dir != 0) {
-            double want = dir * max_speed;
-            double d = want - vy;
-            double step = accel * dt;
-            vy += clampv(d, -step, step);
-        } else {
-            double step = brake * dt;
-            vy -= clampv(vy, -step, step);
-        }
+    // `want` is a target velocity, not a direction.  Asking for a speed lets
+    // the computer ease into position instead of slamming between full tilt
+    // and a dead stop, and lets a human's paddle coast while the terminal
+    // makes up its mind about whether a key is still held.
+    void drive(double want, double dt, double H) {
+        double rate = (want == 0.0) ? brake : accel;
+        double step = rate * dt;
+        vy += clampv(want - vy, -step, step);
         y += vy * dt;
         if (y < half) { y = half; vy = 0; }
         if (y > H - half) { y = H - half; vy = 0; }
     }
+};
+
+// --------------------------------------------------------------------- input
+
+// What the terminal's auto-repeat looks like here.  Learned once and shared by
+// both players, since it is a property of the terminal, not of the key.
+struct Repeat {
+    double delay = 0.0;   // press -> first repeat
+    double rate = 0.0;    // repeat -> repeat
+    static double blend(double have, double seen) {
+        return have > 0.0 ? have * 0.7 + seen * 0.3 : seen;
+    }
+};
+Repeat g_repeat;
+
+// One player's key state.  A press buys a fixed slice of full speed; after
+// that the paddle coasts rather than stopping, because the next auto-repeat -
+// if the key really is still down - is still on its way.  By the time it
+// arrives the repeat cadence is known, and the windows stretch to cover it.
+struct Hold {
+    int dir = 0;
+    double last = -1e9;
+    double full = 0.0;    // seconds of full speed from `last`
+    double coast = 0.0;   // ...then this many more at COAST_SPEED
+
+    void press(int d, double t) {
+        double gap = t - last;
+        if (d != dir || gap >= REPEAT_SPLIT) {
+            repeats_ = 0;
+        } else {
+            if (repeats_ == 0) {
+                if (gap > DELAY_FLOOR) g_repeat.delay = Repeat::blend(g_repeat.delay, gap);
+            } else if (gap < RATE_CEILING) {
+                g_repeat.rate = Repeat::blend(g_repeat.rate, gap);
+            }
+            ++repeats_;
+        }
+        dir = d;
+        last = t;
+
+        if (repeats_ == 0) {   // could be a tap, could be the start of a hold
+            double delay = g_repeat.delay > 0.0 ? g_repeat.delay : DEFAULT_DELAY;
+            full = TAP_HOLD;
+            coast = clampv(delay * 1.25 + 0.05, TAP_HOLD + 0.1, 0.9) - full;
+        } else {               // definitely held: just outlast the repeats
+            double rate = g_repeat.rate > 0.0 ? g_repeat.rate : DEFAULT_RATE;
+            full = clampv(rate * 2.0 + 0.04, 0.09, 0.28);
+            coast = std::max(rate * 2.0, 0.08);
+        }
+    }
+
+    // Fraction of top speed the paddle should be running at, signed.
+    double want(double t) {
+        if (dir == 0) return 0.0;
+        if (t <= last + full) return dir;
+        if (t <= last + full + coast) return dir * COAST_SPEED;
+        dir = 0;
+        return 0.0;
+    }
+
+private:
+    int repeats_ = 0;
 };
 
 // ---------------------------------------------------------------------- game
@@ -503,10 +615,10 @@ public:
             state_ = (state_ == State::Paused) ? State::Play : State::Paused;
             break;
         case 'm': case 'M': setup(Mode::Demo); break;
-        case KEY_UP:    hold(mode_ == Mode::TwoPlayer ? p2_ : p1_, -1); break;
-        case KEY_DOWN:  hold(mode_ == Mode::TwoPlayer ? p2_ : p1_, +1); break;
-        case 'w': case 'W': case 'k': hold(p1_, -1); break;
-        case 's': case 'S': case 'j': hold(p1_, +1); break;
+        case KEY_UP:    press(mode_ == Mode::TwoPlayer ? p2_ : p1_, -1); break;
+        case KEY_DOWN:  press(mode_ == Mode::TwoPlayer ? p2_ : p1_, +1); break;
+        case 'w': case 'W': case 'k': press(p1_, -1); break;
+        case 's': case 'S': case 'j': press(p1_, +1); break;
         default: break;
         }
         return true;
@@ -514,31 +626,37 @@ public:
 
     void update(double dt) {
         double t = now_seconds();
-        if (p1_.until < t) p1_.dir = 0;
-        if (p2_.until < t) p2_.dir = 0;
+        double want_l = p1_.want(t), want_r = p2_.want(t);
 
         if (state_ == State::Paused || state_ == State::Over) return;
 
         bool live = t >= serve_at_;
-        if (!left_.ai)  left_.drive(p1_.dir, dt, geo_.H);
-        if (!right_.ai) right_.drive(p2_.dir, dt, geo_.H);
-        if (left_.ai)  drive_ai(left_, dt, live);
-        if (right_.ai) drive_ai(right_, dt, live);
+        if (left_.ai)  aim_ai(left_, live);
+        if (right_.ai) aim_ai(right_, live);
 
-        if (!live) return;
-
-        // Fixed substeps keep the physics identical whatever the frame rate.
+        // One fixed timestep for everything that moves, paddles included: a
+        // paddle's position and speed at the moment of contact then do not
+        // depend on how fast the terminal happens to be drawing.
         accum_ += dt;
         double h = 1.0 / PHYS_HZ;
         int guard = 0;
-        while (accum_ >= h && guard++ < 400) {
+        while (accum_ >= h && guard++ < 600) {
             accum_ -= h;
+            if (left_.ai)  step_ai(left_, h);
+            else           left_.drive(want_l * left_.max_speed, h, geo_.H);
+            if (right_.ai) step_ai(right_, h);
+            else           right_.drive(want_r * right_.max_speed, h, geo_.H);
+            if (!live) continue;
+
             step(h);
+            trail_clock_ += h;
+            if (trail_clock_ >= TRAIL_SAMPLE) {
+                trail_clock_ -= TRAIL_SAMPLE;
+                trail_.push_front({ball_.x, ball_.y});
+                while (static_cast<int>(trail_.size()) > TRAIL_LEN) trail_.pop_back();
+            }
             if (state_ != State::Play && state_ != State::Menu) break;
         }
-
-        trail_.push_front({ball_.x, ball_.y});
-        while (static_cast<int>(trail_.size()) > TRAIL_LEN) trail_.pop_back();
     }
 
     // Read-only view of the simulation, for tests and diagnostics.
@@ -576,13 +694,9 @@ public:
     }
 
 private:
-    struct Hold { int dir = 0; double until = 0; };
     struct Pt { double x, y; };
 
-    void hold(Hold& h, int dir) {
-        h.dir = dir;
-        h.until = now_seconds() + KEY_HOLD;
-    }
+    void press(Hold& h, int dir) { h.press(dir, now_seconds()); }
 
     void serve(double dir) {
         ball_.x = geo_.W / 2.0;
@@ -593,6 +707,7 @@ private:
         ball_.spin = frand(-4.0, 4.0);
         serve_at_ = now_seconds() + (winner_ ? 0.0 : SERVE_DELAY);
         accum_ = 0.0;
+        trail_clock_ = 0.0;
         trail_.clear();
         left_.committed = right_.committed = false;
     }
@@ -682,7 +797,9 @@ private:
         return clampv(b.y, 0.0, geo_.H);
     }
 
-    void drive_ai(Paddle& p, double dt, bool live) {
+    // Deciding where to go is a once-a-frame job; getting there happens on
+    // the physics clock, in step_ai below.
+    void aim_ai(Paddle& p, bool live) {
         const AiParams& a = p.params;
         bool incoming = live && ((ball_.vx > 0) == (p.face_dir < 0));
         double crossed = p.face_dir < 0 ? ball_.x / geo_.W
@@ -700,8 +817,11 @@ private:
             p.aim_off = (frand() + frand() - 1.0) * a.aim * p.half;
         }
 
+        p.waiting = p.committed && now_seconds() < p.react_at;
+        if (p.waiting) return;
+
         double target = geo_.H / 2.0;   // idle: drift back to the middle
-        if (p.committed && now_seconds() >= p.react_at) {
+        if (p.committed) {
             // Weak opponents just chase the ball's current height; strong ones
             // solve the intercept with the same integrator the ball uses, so
             // they read spin and wall bounces correctly.
@@ -709,22 +829,20 @@ private:
             double solved = a.predict > 0.0 ? predict_intercept(p) : naive;
             target = naive + (solved - naive) * a.predict + p.aim_off;
             target = clampv(target, p.half, geo_.H - p.half);
-        } else if (p.committed) {
-            p.drive(0, dt, geo_.H);   // still reacting
-            return;
         }
+        p.target = target;
+    }
 
-        double delta = target - p.y;
-        int dir = 0;
-        if (std::fabs(delta) > 0.25) {
-            dir = delta > 0 ? 1 : -1;
-            // Ease off near the target so the paddle settles instead of
-            // oscillating, and so its velocity is honest at the moment of
-            // contact - a swinging paddle imparts spin.
-            double brake = p.vy * p.vy / (2.0 * p.accel);
-            if (brake > std::fabs(delta) && sgn(p.vy) == dir) dir = 0;
-        }
-        p.drive(dir, dt, geo_.H);
+    void step_ai(Paddle& p, double h) {
+        if (p.waiting) { p.drive(0.0, h, geo_.H); return; }
+        // Ask for a speed proportional to the distance left, so the paddle
+        // settles onto its mark instead of oscillating around it - and so its
+        // velocity is honest at the moment of contact, since a swinging paddle
+        // imparts spin.
+        double delta = p.target - p.y;
+        double want = clampv(delta / SETTLE_TIME, -p.max_speed, p.max_speed);
+        if (std::fabs(delta) < 0.05) want = 0.0;
+        p.drive(want, h, geo_.H);
     }
 
     // ------------------------------------------------------------- rendering
@@ -736,7 +854,8 @@ private:
 
         int mid = geo_.cols / 2;
         for (int s = geo_.play_top * 2; s <= geo_.play_bot * 2 + 1; ++s)
-            if (((s - geo_.play_top * 2) / 2) % 2 == 0) canvas_.plot(s, mid, INK_NET);
+            if (((s - geo_.play_top * 2) / 2) % 2 == 0)
+                canvas_.plot_col(s, mid, INK_NET);
     }
 
     void draw_paddles() {
@@ -747,12 +866,22 @@ private:
         }
     }
 
+    // The ball is a column wide and half a row tall - a square, given the
+    // shape of a cell - but it is placed on the half-column grid, so it slides
+    // rather than hopping from column to column.
+    void dot(double x, double y, uint8_t ink) {
+        int sub = geo_.subcol_of(x - BALL_RX);
+        int row = geo_.subrow_of(y);
+        canvas_.plot(row, sub, ink);
+        canvas_.plot(row, sub + 1, ink);
+    }
+
     void draw_ball() {
         for (size_t i = trail_.size(); i-- > 0;) {
             uint8_t ink = (i < trail_.size() / 3) ? INK_TRAIL1 : INK_TRAIL2;
-            canvas_.plot(geo_.subrow_of(trail_[i].y), geo_.col_of(trail_[i].x), ink);
+            dot(trail_[i].x, trail_[i].y, ink);
         }
-        canvas_.plot(geo_.subrow_of(ball_.y), geo_.col_of(ball_.x), INK_BALL);
+        dot(ball_.x, ball_.y, INK_BALL);
     }
 
     static const char* digit_row(int d, int r) {
@@ -782,8 +911,8 @@ private:
                     if (bits[b] != '#') continue;
                     for (int dy = 0; dy < 2; ++dy)
                         for (int dx = 0; dx < 2; ++dx)
-                            canvas_.plot(sub_top + r * 2 + dy, col + b * 2 + dx,
-                                         INK_SCORE);
+                            canvas_.plot_col(sub_top + r * 2 + dy, col + b * 2 + dx,
+                                             INK_SCORE);
                 }
             }
             col += digit_w + gap;
@@ -877,7 +1006,7 @@ private:
     int score_l_ = 0, score_r_ = 0;
     int winner_ = 0;
     int difficulty_ = 1;
-    double serve_at_ = 0.0, accum_ = 0.0;
+    double serve_at_ = 0.0, accum_ = 0.0, trail_clock_ = 0.0;
     double serve_v_ = 0, max_v_ = 0, min_v_ = 0, player_v_ = 0;
 };
 
@@ -919,6 +1048,7 @@ int main() {
     const double frame = 1.0 / TARGET_FPS;
     g_now = real_seconds();
     double previous = g_now;
+    double deadline = g_now;
     bool running = true;
 
     while (running) {
@@ -951,9 +1081,15 @@ int main() {
             refresh();
         }
 
-        double sleep = frame - (real_seconds() - start);
-        if (sleep > 0)
-            std::this_thread::sleep_for(std::chrono::duration<double>(sleep));
+        // Pace to an absolute deadline rather than sleeping a fixed slice:
+        // sleep always overshoots a little, and sleeping "one frame" from
+        // wherever that left us lets the error pile up into visible judder.
+        deadline += frame;
+        double slack = deadline - real_seconds();
+        if (slack > 0)
+            std::this_thread::sleep_for(std::chrono::duration<double>(slack));
+        else if (slack < -frame)
+            deadline = real_seconds();   // fell badly behind; start afresh
     }
 
     endwin();
