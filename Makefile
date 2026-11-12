@@ -16,21 +16,26 @@ endif
 
 all: termpong
 
-termpong: termpong.cpp
+termpong: termpong.cpp pong_core.h
 	$(CXX) $(CXXFLAGS) $(CURSES_CFLAGS) -o $@ $< $(CURSES_LIBS)
 
 # Headless simulation tests: physics, collisions, scoring and the opponent.
 test: tests/test_pong
 	./tests/test_pong
 
-tests/test_pong: tests/test_pong.cpp termpong.cpp
+tests/test_pong: tests/test_pong.cpp termpong.cpp pong_core.h
 	$(CXX) $(CXXFLAGS) $(CURSES_CFLAGS) -o $@ $< $(CURSES_LIBS)
+
+# Windowed front end; needs GTK 4.  Not part of 'all' so the terminal game
+# still builds on machines without GTK.
+gtkpong: gtkpong.cpp pong_core.h
+	$(CXX) $(CXXFLAGS) $(shell pkg-config --cflags gtk4) -o $@ $< $(shell pkg-config --libs gtk4)
 
 install: termpong
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 termpong $(DESTDIR)$(PREFIX)/bin/termpong
 
 clean:
-	rm -f termpong tests/test_pong
+	rm -f termpong gtkpong tests/test_pong
 
 .PHONY: all test install clean
