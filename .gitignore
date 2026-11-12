@@ -1,3 +1,4 @@
 termpong
 tests/test_pong
 *.o
+gtkpong

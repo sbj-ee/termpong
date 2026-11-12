@@ -4,6 +4,8 @@
 #include "../termpong.cpp"
 #undef main
 
+using namespace pong;
+
 #include <cassert>
 #include <cstdio>
 
@@ -103,8 +105,8 @@ int main() {
 
     // --- long demo match: two computers rallying for five simulated minutes
     {
-        Game g(30, 100);
-        g.setup(Mode::Demo);          // attract mode never ends
+        Game g(30, 100);   // a fresh game is already in attract mode, which
+                           // never ends
         Stats st = run(g, 300.0, false, false);
         auto s = g.snapshot();
         check(!st.nan_seen, "no NaN in a five-minute match");
@@ -190,8 +192,7 @@ int main() {
     // --- the computer settles onto its mark rather than hunting around it
     {
         g_now = 0.0;
-        Game g(30, 100);
-        g.setup(Mode::Demo);
+        Game g(30, 100);   // attract mode: two computers
         const double dt = 1.0 / 60.0;
         double prev_y = g.snapshot().right_y, prev_v = 0.0, jerk = 0.0;
         int frames = 60 * 60;
